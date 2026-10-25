@@ -102,6 +102,28 @@ describe("NativeSubagentRuntime lifecycle", () => {
     expect(published[1]?.update).toMatchObject({ state: "completed" });
   });
 
+  it("carries the subagent's usage meta on the terminal state update", async () => {
+    const published: AcpSessionNotification[] = [];
+    const value = child();
+    const session = sessionWith(value);
+    const publish = vi.fn(async (notification: AcpSessionNotification) => {
+      published.push(notification);
+    });
+
+    await finishNativeSubagent(session, value.sessionId, "completed", publish, {
+      claudeCode: {
+        subagentUsage: { agentId: "child-1", models: [] },
+      },
+    });
+
+    expect(published.at(-1)?.update).toMatchObject({
+      sessionUpdate: "subagent_state_update",
+      subagentSessionId: "child-1",
+      state: "completed",
+      _meta: { claudeCode: { subagentUsage: { agentId: "child-1" } } },
+    });
+  });
+
   it("falls back to one ordinary failed tool call when no child ever starts", async () => {
     const runtime = new NativeSubagentRuntime("air", "root", {}, async () => {}, { log: () => {} });
 
@@ -897,6 +919,40 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         },
       });
     }
+  });
+
+  it("stamps the ending subagent_update with the subagent's usage", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1", undefined, {
+      toolUseId: "launch-1",
+      agentId: "worker-1",
+      models: [
+        {
+          model: "claude-sonnet-5-5",
+          inputTokens: 23,
+          outputTokens: 603,
+          cachedReadTokens: 3001,
+          cachedWriteTokens: 3042,
+          totalTokens: 6669,
+        },
+      ],
+    });
+
+    expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "end_turn" });
+    expect(published.at(-1)?.update).toMatchObject({
+      sessionUpdate: "subagent_update",
+      sessionId: "worker-1",
+      _meta: {
+        claudeCode: {
+          subagentUsage: {
+            toolUseId: "launch-1",
+            agentId: "worker-1",
+            agentType: "Explore",
+            models: [{ model: "claude-sonnet-5-5", totalTokens: 6669 }],
+          },
+        },
+      },
+    });
   });
 
   it("buffers model observations until the child is announced", async () => {

@@ -6906,6 +6906,121 @@ describe("subagent permission attribution (issue #851)", () => {
     };
   }
 
+  /** The turn ends an Agent/Task call: its final update carries the
+   *  subagent's cumulative usage, read from its transcript (issue #1427). */
+  it("stamps the Agent result with the subagent's cumulative usage", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-usage-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const sessionId = "test-session";
+      const project = path.join(configDir, "projects", "proj");
+      await mkdir(path.join(project, sessionId, "subagents"), { recursive: true });
+      await writeFile(path.join(project, `${sessionId}.jsonl`), "{}\n");
+      await writeFile(
+        path.join(project, sessionId, "subagents", "agent-agt_123.jsonl"),
+        [
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              role: "assistant",
+              model: "claude-sonnet-5-5",
+              usage: {
+                input_tokens: 11,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 301,
+              },
+            },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              role: "assistant",
+              model: "claude-sonnet-5-5",
+              usage: {
+                input_tokens: 12,
+                cache_creation_input_tokens: 41,
+                cache_read_input_tokens: 3001,
+                output_tokens: 302,
+              },
+            },
+          }),
+          "",
+        ].join("\n"),
+      );
+
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      injectGeneratorSession(
+        agent,
+        makeGenerator([
+          rootToolUse("toolu_task", "Task", { description: "Investigate", prompt: "Find it" }),
+          {
+            type: "user",
+            uuid: randomUUID(),
+            session_id: sessionId,
+            parent_tool_use_id: null,
+            tool_use_result: {
+              status: "completed",
+              agentId: "agt_123",
+              agentType: "general-purpose",
+              content: [{ type: "text", text: "Done." }],
+              totalTokens: 3356,
+            },
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "toolu_task", content: "Done." }],
+            },
+          },
+          successResult(),
+        ]),
+      );
+      await agent.prompt({ sessionId, prompt: [{ type: "text", text: "go" }] });
+
+      const final = updates.find(
+        ({ update }) =>
+          update.sessionUpdate === "tool_call_update" &&
+          "toolCallId" in update &&
+          update.toolCallId === "toolu_task" &&
+          "status" in update &&
+          update.status === "completed",
+      );
+      expect(final?.update._meta).toMatchObject({
+        claudeCode: {
+          toolName: "Task",
+          subagentUsage: {
+            toolUseId: "toolu_task",
+            agentId: "agt_123",
+            agentType: "general-purpose",
+            models: [
+              {
+                model: "claude-sonnet-5-5",
+                inputTokens: 23,
+                outputTokens: 603,
+                cachedReadTokens: 3001,
+                cachedWriteTokens: 41,
+                totalTokens: 3668,
+              },
+            ],
+          },
+        },
+      });
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
   it("releases a tool call that ends cancelled on v2, as one that ends failed", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -7278,6 +7393,116 @@ describe("subagent permission attribution (issue #851)", () => {
         },
       ]),
     );
+  });
+
+  /** The task_notification of a background subagent reads the transcript and
+   *  stamps the terminal state update with the cumulative usage (#1427). */
+  it("carries the transcript's cumulative usage on the terminal state update", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-usage-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const project = path.join(configDir, "projects", "proj");
+      await mkdir(path.join(project, "test-session", "subagents"), { recursive: true });
+      await writeFile(path.join(project, "test-session.jsonl"), "{}\n");
+      await writeFile(
+        path.join(project, "test-session", "subagents", "agent-agent-42.jsonl"),
+        [
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              role: "assistant",
+              model: "claude-sonnet-5-5",
+              usage: {
+                input_tokens: 11,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 301,
+              },
+            },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              role: "assistant",
+              model: "claude-sonnet-5-5",
+              usage: {
+                input_tokens: 12,
+                cache_creation_input_tokens: 41,
+                cache_read_input_tokens: 3001,
+                output_tokens: 302,
+              },
+            },
+          }),
+          "",
+        ].join("\n"),
+      );
+
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: AIR_NATIVE_SUBAGENTS,
+      });
+      injectGeneratorSession(
+        agent,
+        makeGenerator([
+          { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+          {
+            type: "system",
+            subtype: "task_notification",
+            task_id: "agent-42",
+            tool_use_id: "toolu_parent",
+            status: "completed",
+            output_file: "",
+            summary: "done",
+            uuid: randomUUID(),
+            session_id: "test-session",
+          },
+          successResult(),
+        ]),
+      );
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+      const terminal = updates.find(
+        ({ update }) => update.sessionUpdate === "subagent_state_update",
+      );
+      expect(terminal?.update).toMatchObject({
+        subagentSessionId: "agent-42",
+        state: "completed",
+        _meta: {
+          claudeCode: {
+            subagentUsage: {
+              toolUseId: "toolu_parent",
+              agentId: "agent-42",
+              agentType: "Explore",
+              models: [
+                {
+                  model: "claude-sonnet-5-5",
+                  inputTokens: 23,
+                  outputTokens: 603,
+                  cachedReadTokens: 3001,
+                  cachedWriteTokens: 41,
+                  totalTokens: 3668,
+                },
+              ],
+            },
+          },
+        },
+      });
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      await rm(configDir, { recursive: true, force: true });
+    }
   });
 
   describe("the subagents RFD, for a client that declares subagents and is not AIR", () => {

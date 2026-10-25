@@ -5,6 +5,7 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
+import type { SubagentUsageReport } from "./subagent-usage.js";
 import { isFinalToolCallStatus } from "./tool-calls/renderer.js";
 
 /** The work state of a child, as the RFD's `subagent_update.state` carries it. */
@@ -649,6 +650,7 @@ export class NativeSubagentRuntime {
     deliver: Publish,
     toolUseId?: string | null,
     end?: TaskEnd,
+    usage?: SubagentUsageReport,
   ): Promise<void> {
     if (!this.enabled) return;
     const state = nativeSubagentState(status);
@@ -680,11 +682,17 @@ export class NativeSubagentRuntime {
           for (const pending of this.takePending(child.parentToolUseId)) await deliver(pending);
         }
         if (this.form === "rfd") {
-          await this.reportState(child, rfdEndState(state, end));
+          await this.reportState(child, rfdEndState(state, end), subagentUsageMeta(child, usage));
           child.missingError = state === "failed" && !end?.error && !end?.unexplained;
           if (child.parentToolUseId) (child.endedRuns ??= new Set()).add(child.parentToolUseId);
         } else {
-          await finishNativeSubagent(this.session, taskId, state, this.publish);
+          await finishNativeSubagent(
+            this.session,
+            taskId,
+            state,
+            this.publish,
+            subagentUsageMeta(child, usage),
+          );
         }
       } finally {
         if (child.parentToolUseId) {
@@ -1069,12 +1077,21 @@ export class NativeSubagentRuntime {
   }
 
   /** The RFD form: publishes the work state of `child` on its parent. */
-  private async reportState(child: NativeSubagent, state: WorkState): Promise<void> {
+  private async reportState(
+    child: NativeSubagent,
+    state: WorkState,
+    meta?: SessionNotification["update"]["_meta"],
+  ): Promise<void> {
     child.workState = state.state;
     child.missingError = false;
     await this.publish({
       sessionId: child.parentSessionId,
-      update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, state },
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        state,
+        ...(meta ? { _meta: meta } : {}),
+      },
     });
   }
 
@@ -1544,6 +1561,7 @@ export async function finishNativeSubagent(
   taskId: string,
   state: SubagentState,
   publish: Publish,
+  meta?: SessionNotification["update"]["_meta"],
 ): Promise<void> {
   const child = session.nativeSubagentsByTaskId?.get(taskId);
   if (!child || child.terminalState !== undefined) return;
@@ -1556,6 +1574,7 @@ export async function finishNativeSubagent(
         sessionUpdate: "subagent_state_update",
         subagentSessionId: child.sessionId,
         state,
+        ...(meta ? { _meta: meta } : {}),
       },
     });
     child.terminalState = state;
@@ -1566,6 +1585,26 @@ export async function finishNativeSubagent(
   } finally {
     if (child.terminalPromise === finish) child.terminalPromise = undefined;
   }
+}
+
+/**
+ * The `_meta` that carries a subagent's cumulative usage (issue #1427) on the
+ * update that ends it, with the child's role as `agentType` when the caller
+ * did not know one.
+ */
+function subagentUsageMeta(
+  child: NativeSubagent,
+  usage: SubagentUsageReport | undefined,
+): SessionNotification["update"]["_meta"] {
+  if (!usage) return undefined;
+  return {
+    claudeCode: {
+      subagentUsage: {
+        ...usage,
+        ...(usage.agentType || !child.role ? {} : { agentType: child.role }),
+      },
+    },
+  };
 }
 
 /**

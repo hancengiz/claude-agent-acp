@@ -14,6 +14,7 @@ import {
   withAirMeta,
 } from "../air-extension.js";
 import { exitPlanModeRawOutput } from "../exit-plan.js";
+import type { SubagentUsageReport } from "../subagent-usage.js";
 import { isAbortedToolResult, type ToolResultMeta } from "../tool-result-meta.js";
 import { ClientCapabilities } from "./client-capabilities.js";
 import { resultText, textContent, toAcpContentUpdate, toolResponseMarkers } from "./content.js";
@@ -69,6 +70,12 @@ export type ToolUpdateMeta = {
     userFeedback?: string;
     /* The MCP server of an `mcp__*` tool, on a permission request. */
     mcpServer?: { name: string; source: string };
+    /* The cumulative token usage of the subagent that this update ends, per
+       model and token type, from its transcript (issue #1427). Breaks part
+       of `_meta.quota.model_usage` down — that turn total already counts
+       subagent spend, so the two must not be added. Absent when the
+       transcript holds no usage. */
+    subagentUsage?: SubagentUsageReport;
   };
   /* The AIR client flags of the ACP tool call contract (`docs/air-extensions.md#tool-call-contract`). */
   jetbrains?: {
@@ -441,7 +448,12 @@ export class AcpToolCallRenderer {
   result(
     toolUse: ToolUse,
     result: ResultBlock,
-    options: { structured?: unknown; nonExecution?: ToolResultMeta; cancelled?: boolean } = {},
+    options: {
+      structured?: unknown;
+      nonExecution?: ToolResultMeta;
+      cancelled?: boolean;
+      subagentUsage?: SubagentUsageReport;
+    } = {},
   ): ToolCallUpdate[] {
     const facts = this.resultFacts(toolUse, result, options.structured);
     const { _meta: resultMeta, ...fields } = this.fieldsOfResult(toolUse, result, facts);
@@ -487,7 +499,11 @@ export class AcpToolCallRenderer {
     delete fields.planFileReleased;
     updates.push({
       _meta: {
-        claudeCode: { toolName: toolUse.name, ...(options.nonExecution ?? {}) },
+        claudeCode: {
+          toolName: toolUse.name,
+          ...(options.nonExecution ?? {}),
+          ...(options.subagentUsage ? { subagentUsage: options.subagentUsage } : {}),
+        },
         ...(resultMeta?.terminal_exit ? { terminal_exit: resultMeta.terminal_exit } : {}),
       } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,

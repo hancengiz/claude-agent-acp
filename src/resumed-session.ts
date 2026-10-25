@@ -1,4 +1,5 @@
 import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import { accessSync, readdirSync } from "node:fs";
 import { access, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { claudeConfigDir } from "./paths.js";
@@ -123,6 +124,31 @@ export async function findTranscript(sessionId: string): Promise<string | undefi
     const candidate = path.join(projects, directory, `${sessionId}.jsonl`);
     try {
       await access(candidate);
+      return candidate;
+    } catch {
+      // Not in this project directory.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The synchronous twin of {@link findTranscript}, for callers that sit on the
+ * message pump and must not change its await structure. It reads at most a
+ * directory listing and a stat per project directory.
+ */
+export function findTranscriptSync(sessionId: string): string | undefined {
+  const projects = path.join(claudeConfigDir(), "projects");
+  let directories: string[];
+  try {
+    directories = readdirSync(projects);
+  } catch {
+    return undefined;
+  }
+  for (const directory of directories) {
+    const candidate = path.join(projects, directory, `${sessionId}.jsonl`);
+    try {
+      accessSync(candidate);
       return candidate;
     } catch {
       // Not in this project directory.

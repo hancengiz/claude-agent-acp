@@ -88,7 +88,7 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
 }
 
 /** The folder of the subagent transcripts, next to the session transcript `transcript`. */
-function subagentsDirectory(transcript: string, sessionId: string): string {
+export function subagentsDirectory(transcript: string, sessionId: string): string {
   return path.join(path.dirname(transcript), sessionId, "subagents");
 }
 

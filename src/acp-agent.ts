@@ -289,6 +289,8 @@ import {
   unregisterHookCallback,
 } from "./tools.js";
 import { previewPatchContent } from "./diff.js";
+import { readSubagentUsage, type SubagentUsageReport } from "./subagent-usage.js";
+import { structuredResult } from "./tool-calls/content.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "./tool-calls/background.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
@@ -6581,14 +6583,28 @@ export class ClaudeAcpAgent {
                 // nothing: the child and its live task belong to the new run.
                 if (subagents.isStaleEnd(message.task_id, message.tool_use_id)) break;
                 // The task settled — no further tool calls can originate
-                // from it, so its registry entry can be dropped.
-                await subagents.finishTask(
-                  message.task_id,
-                  message.status,
-                  sendUpdate,
-                  message.tool_use_id,
-                  { reason: message.reason },
-                );
+                // from it, so its registry entry can be dropped. A subagent's
+                // transcript holds every call with its final usage now that
+                // its last call is in (issue #1427); a non-subagent task has
+                // no transcript and reads nothing.
+                {
+                  const liveTask = session.liveBackgroundTasks.get(message.task_id);
+                  const usageReport = liveTask?.isSubagent
+                    ? readSubagentUsage({
+                        sessionId: params.sessionId,
+                        agentId: message.task_id,
+                        ...(message.tool_use_id ? { toolUseId: message.tool_use_id } : {}),
+                      })
+                    : undefined;
+                  await subagents.finishTask(
+                    message.task_id,
+                    message.status,
+                    sendUpdate,
+                    message.tool_use_id,
+                    { reason: message.reason },
+                    usageReport ?? undefined,
+                  );
+                }
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
                   status: message.status,
@@ -6633,12 +6649,26 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
+                  // The notification usually read the usage first (issue
+                  // #1427); when it was skipped, the terminal patch is the
+                  // only end signal and reads it here instead.
+                  const liveTask = session.liveBackgroundTasks.get(message.task_id);
+                  const usageReport = liveTask?.isSubagent
+                    ? readSubagentUsage({
+                        sessionId: params.sessionId,
+                        agentId: message.task_id,
+                        ...(liveTask.parentToolUseId
+                          ? { toolUseId: liveTask.parentToolUseId }
+                          : {}),
+                      })
+                    : undefined;
                   await subagents.finishTask(
                     message.task_id,
                     message.patch.status,
                     sendUpdate,
                     undefined,
                     { error: message.patch.status === "failed" ? message.patch.error : undefined },
+                    usageReport ?? undefined,
                   );
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,
@@ -8268,6 +8298,20 @@ export class ClaudeAcpAgent {
               }
             }
 
+            // The cumulative usage of each subagent this message's results
+            // end (issue #1427), read while the per-tool-use cache still
+            // names the tools.
+            const subagentUsage =
+              message.type === "user"
+                ? endedSubagentUsage(
+                    params.sessionId,
+                    session.toolUseCache,
+                    session.liveBackgroundTasks,
+                    content,
+                    message.tool_use_result,
+                  )
+                : undefined;
+
             for (const notification of toAcpNotifications(
               content,
               message.message.role,
@@ -8291,6 +8335,7 @@ export class ClaudeAcpAgent {
                   message.type === "user"
                     ? (message as { tool_result_meta?: unknown }).tool_result_meta
                     : undefined,
+                subagentUsage,
               },
             )) {
               // sendUpdate records delivery. Subagent text/thinking is
@@ -13267,6 +13312,59 @@ function rememberResolvedToolNames(
   }
 }
 
+/**
+ * The cumulative usage (issue #1427) of every subagent that a tool_result of
+ * one user message ends, keyed by its tool_use id. The transcript is the only
+ * source that holds every API call with its final usage: the structured
+ * AgentOutput counts the last call only, and the SDK stream cannot be summed.
+ * Undefined when the message ends no subagent. Synchronous — it runs on the
+ * message pump, whose await structure the trailer/settlement timing of tests
+ * and cancels depends on.
+ */
+function endedSubagentUsage(
+  sessionId: string,
+  toolUseCache: ToolUseCache,
+  liveBackgroundTasks: ReadonlyMap<string, { parentToolUseId?: string; isSubagent: boolean }>,
+  content: unknown,
+  toolUseResult: unknown,
+): Map<string, SubagentUsageReport> | undefined {
+  const results = (Array.isArray(content) ? content : []).filter(
+    (block): block is { type: "tool_result"; tool_use_id: string } => {
+      if (typeof block !== "object" || block === null) return false;
+      if (!("type" in block) || block.type !== "tool_result") return false;
+      return "tool_use_id" in block && typeof block.tool_use_id === "string";
+    },
+  );
+  if (results.length === 0) return undefined;
+  // `tool_use_result` is message-level and describes the only tool_result of
+  // the message, mirroring the guard inside `toAcpNotifications`. Read the
+  // fields off a record: AgentOutput's variants do not all carry them.
+  const structured =
+    results.length === 1 ? structuredResult<Record<string, unknown>>(toolUseResult) : undefined;
+  const agentId = typeof structured?.agentId === "string" ? structured.agentId : undefined;
+  const agentType = typeof structured?.agentType === "string" ? structured.agentType : undefined;
+  const reports = new Map<string, SubagentUsageReport>();
+  for (const { tool_use_id: toolUseId } of results) {
+    if (!isNativeSubagentControlTool(toolUseCache[toolUseId]?.name)) continue;
+    // A sync subagent's structured report names it; a backgrounded one may
+    // carry no structured output, but its spawn is still registered.
+    const resolvedAgentId =
+      agentId ??
+      [...liveBackgroundTasks].find(
+        ([, task]) => task.isSubagent && task.parentToolUseId === toolUseId,
+      )?.[0];
+    if (!resolvedAgentId) continue;
+    const report = readSubagentUsage({
+      sessionId,
+      agentId: resolvedAgentId,
+      toolUseId,
+      ...(agentType ? { agentType } : {}),
+    });
+    if (report) reports.set(toolUseId, report);
+  }
+  return reports.size > 0 ? reports : undefined;
+}
+
 export function toAcpNotifications(
   content: string | ContentBlockParam[] | BetaContentBlock[] | BetaRawContentBlockDelta[],
   role: "assistant" | "user",
@@ -13313,6 +13411,11 @@ export function toAcpNotifications(
     // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
     // denied/interrupted tool_call_updates with why the tool never ran.
     toolResultMeta?: unknown;
+    // The cumulative usage of the subagents that this message's tool_results
+    // end (issue #1427), keyed by tool_use id; `endedSubagentUsage` reads it
+    // from their transcripts. The tool_result of an Agent/Task call stamps
+    // its final update with it.
+    subagentUsage?: Map<string, SubagentUsageReport>;
     // True when the content is a result of the work that a `session/cancel`
     // stopped. An error result then ends a run that the cancel aborted,
     // whichever kind the SDK stamped on it (see `resultStatus`).
@@ -13626,6 +13729,7 @@ export function toAcpNotifications(
               structured: toolUseResult,
               nonExecution,
               cancelled: options?.cancelled,
+              subagentUsage: options?.subagentUsage?.get(chunk.tool_use_id),
             })
             .reverse();
           for (const outputUpdate of rest.reverse()) {

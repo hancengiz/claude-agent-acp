@@ -102,6 +102,49 @@ Without either signal, Agent and Task stay ordinary tool calls and child interac
 root session. Clients that use the historical `_meta["subagent-transcript"]` capability or the
 `forwardSubagentText` session option retain the flattened child transcript.
 
+#### Subagent spend
+
+When a subagent ends, the update that ends it carries `_meta.claudeCode.subagentUsage`: the
+subagent's cumulative token usage across all of its API calls, split by model and token type. The
+ending update is the final `tool_call_update` of the Agent or Task call; in the subagent-session
+forms above it is the child's terminal `subagent_update` (`subagent_state_update` for AIR). It
+reports for a child that completed, failed, or was stopped, and a nested child reports only its
+own calls. The figures come from the subagent's transcript on disk, so the field is absent when
+there is no transcript, as for a remote session.
+
+The per-model rows break part of the turn's `_meta.quota.model_usage` down per subagent — that
+total already counts subagent spend, so a client must not add the two.
+
+```json
+{
+  "claudeCode": {
+    "subagentUsage": {
+      "toolUseId": "toolu_01AbCdEf",
+      "agentId": "a1b2c3d4e5f6a7b8c",
+      "agentType": "general-purpose",
+      "models": [
+        {
+          "model": "claude-sonnet-5-5",
+          "inputTokens": 23,
+          "outputTokens": 603,
+          "thoughtTokens": 0,
+          "cachedReadTokens": 3001,
+          "cachedWriteTokens": 3042,
+          "cachedWrite5mTokens": 3042,
+          "cachedWrite1hTokens": 0,
+          "totalTokens": 6669
+        }
+      ]
+    }
+  }
+}
+```
+
+`thoughtTokens` is part of `outputTokens`, as Claude counts it, and is omitted when unknown;
+`cachedWriteTokens` is the 5m and 1h cache writes added together, and the TTL split is omitted
+when a call reported only a flat write, since the two TTLs are priced differently. A client that
+ignores the field sees no change.
+
 ### Experimental ACP v2
 
 The adapter also serves the [draft ACP v2](https://agentclientprotocol.com/protocol/v2/overview):
